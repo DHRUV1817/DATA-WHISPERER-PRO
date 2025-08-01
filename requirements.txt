@@ -1,0 +1,19 @@
+# Core dependencies
+streamlit==1.32.0
+pandas==2.2.0
+numpy==1.26.3
+
+# Visualization
+plotly==5.19.0
+
+# Machine Learning
+scikit-learn==1.4.0
+
+# Google Gemini AI
+google-generativeai==0.3.2
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Additional utilities
+openpyxl==3.1.2  # For Excel file support
