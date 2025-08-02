@@ -223,7 +223,7 @@ python-dotenv>=1.0.0
 ## 👨‍💻 Author
 
 **Dhruv Pawar**  
-🔗 [GitHub](https://github.com/Dhruv-18) | [Hugging Face](https://huggingface.co/Dhruv-18) | [LinkedIn](https://www.linkedin.com/in/dhruv-pawar-bb8685261/)
+🔗 [GitHub](https://github.com/DHRUV1817) | [Hugging Face](https://huggingface.co/Dhruv-18) | [LinkedIn](https://www.linkedin.com/in/dhruv-pawar-bb8685261/)
 
 *Built with ❤️ during AI/ML internship • Powered by Google Gemini*
 
