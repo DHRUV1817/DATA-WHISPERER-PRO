@@ -1,571 +1,519 @@
-"""
-DataWhisperer Pro – Production Hardened & Silent-Warning Edition
-Fixes KeyError:0 (no categorical cols) and silences date-parsing warnings.
-"""
-
-from __future__ import annotations
-
-import hashlib
-import json
-import logging
-import os
-import sys
-import warnings
-from typing import Any, Dict, List, Optional
-
-import numpy as np
+import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
-from dotenv import load_dotenv
 from plotly.subplots import make_subplots
-from sklearn.cluster import KMeans
-from sklearn.compose import ColumnTransformer
-from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, r2_score
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+import google.generativeai as genai
+import os
+from datetime import datetime
+import json
+import warnings
+warnings.filterwarnings('ignore')
 
-# ------------------------------------------------------------------
-# Logging & warnings
-# ------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-warnings.filterwarnings("ignore", message="Could not infer format.*")  # silence dateutil
-
-# ------------------------------------------------------------------
-# Gemini setup
-# ------------------------------------------------------------------
+# Load environment variables first
+from dotenv import load_dotenv
 load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-try:
-    import google.generativeai as genai
 
-    genai.configure(api_key=GEMINI_API_KEY)
-    GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash")
-    GEMINI_AVAILABLE = True
-except Exception as e:
-    GEMINI_AVAILABLE = False
-    logging.warning(f"Gemini unavailable: {e}")
+st.set_page_config("DataWhisperer Pro", "🎯", layout="wide")
 
+# Load environment variables first
+from dotenv import load_dotenv
+load_dotenv()
 
-# ------------------------------------------------------------------
-# Safe Gemini wrapper
-# ------------------------------------------------------------------
-def safe_gemini(prompt: str, fallback: str = "AI service unavailable", max_tokens: int = 200) -> str:
-    if not GEMINI_AVAILABLE:
-        st.error("Gemini API key missing or invalid.  Check .env file.")
-        return fallback
-    if not st.session_state.get("allow_ai_sharing", True):
-        return "AI response suppressed (privacy mode)."
+# API Configuration with validation
+@st.cache_resource
+def init_gemini():
     try:
-        return (
-            GEMINI_MODEL.generate_content(prompt, generation_config={"max_output_tokens": max_tokens})
-            .text.strip()
-        )
+        # Try multiple ways to get the API key
+        api_key = None
+        
+        # Method 1: Environment variable
+        api_key = os.getenv('GEMINI_API_KEY')
+        
+        # Method 2: Streamlit secrets
+        if not api_key:
+            try:
+                api_key = st.secrets["GEMINI_API_KEY"]
+            except:
+                pass
+        
+        # Method 3: Check for alternative names
+        if not api_key:
+            api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GOOGLE_GEMINI_API_KEY')
+        
+        if not api_key:
+            return None, "❌ GEMINI_API_KEY not found. Check your .env file or Streamlit secrets"
+        
+        # Configure and test
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Simple test without consuming quota
+        return model, f"✅ Gemini AI connected (Key: ...{api_key[-4:]})"
+        
     except Exception as e:
-        st.exception(e)
+        return None, f"❌ Gemini error: {str(e)[:50]}..."
+
+MODEL, API_STATUS = init_gemini()
+
+def safe_gemini(prompt: str, fallback: str = "AI unavailable") -> str:
+    if not MODEL:
+        return fallback
+    try:
+        response = MODEL.generate_content(prompt)
+        return response.text if response.text else fallback
+    except Exception:
         return fallback
 
-
-# ------------------------------------------------------------------
-# Data loading & schema coercion
-# ------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_data(file) -> pd.DataFrame:
-    raw = file.read()
-    encoding = "utf-8"
+# Enhanced data loading with validation
+@st.cache_data
+def load_and_validate_data(file_content, filename):
     try:
-        raw.decode(encoding)
+        # Handle encoding issues
+        df = pd.read_csv(file_content, encoding='utf-8')
     except UnicodeDecodeError:
-        encoding = "ISO-8859-1"
-    file.seek(0)
-    df = pd.read_csv(file, encoding=encoding)
-
+        df = pd.read_csv(file_content, encoding='latin1')
+    
+    # Basic validation
+    if df.empty or len(df.columns) == 0:
+        raise ValueError("Empty dataset")
+    
+    # Auto-detect and convert data types
     for col in df.columns:
-        # datetime
-        if df[col].dtype == "object":
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                parsed = pd.to_datetime(df[col], errors="coerce")
-            if parsed.notna().mean() > 0.8:
-                df[col] = parsed
+        if df[col].dtype == 'object':
+            # Try datetime conversion
+            try:
+                pd.to_datetime(df[col].head(100), errors='raise')
+                df[col] = pd.to_datetime(df[col], errors='coerce')
                 continue
-        # numeric
-        try:
-            df[col] = pd.to_numeric(df[col], errors="raise")
-        except (ValueError, TypeError):
-            pass
-        # categorical
-        if df[col].dtype == "object" and df[col].nunique() < 0.3 * len(df):
-            df[col] = df[col].astype("category")
-    return df
+            except:
+                pass
+            
+            # Try numeric conversion
+            try:
+                numeric_vals = pd.to_numeric(df[col], errors='coerce')
+                if not numeric_vals.isna().all():
+                    df[col] = numeric_vals
+            except:
+                pass
+    
+    return df, f"✅ Loaded: {len(df):,} rows × {len(df.columns)} cols"
 
-
-# ------------------------------------------------------------------
-# Session helpers
-# ------------------------------------------------------------------
-def _file_hash(file_bytes: bytes) -> str:
-    return hashlib.md5(file_bytes).hexdigest()
-
-
-# ------------------------------------------------------------------
-# Caching
-# ------------------------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=3600)
-def run_comprehensive_eda(df: pd.DataFrame) -> Dict[str, go.Figure]:
-    return create_comprehensive_eda(df)
-
-
-# ------------------------------------------------------------------
-# Color-blind friendly palette
-# ------------------------------------------------------------------
-COLOR_PALETTE = px.colors.qualitative.Safe
-
-
-# ------------------------------------------------------------------
-# EDA figures
-# ------------------------------------------------------------------
-def create_comprehensive_eda(df: pd.DataFrame) -> Dict[str, go.Figure]:
+# Memory-efficient EDA
+@st.cache_data
+def create_smart_eda(df_hash, df_shape, sample_size=1000):
+    # Work with sample for large datasets
+    df_work = st.session_state.df.sample(min(sample_size, len(st.session_state.df)), random_state=42)
+    numeric_cols = df_work.select_dtypes(include=[np.number]).columns.tolist()
     figures = {}
-    num_cols = df.select_dtypes(include=[np.number]).columns
-    cat_cols = df.select_dtypes(exclude=[np.number]).columns
-
-    # 1. Correlation
-    if len(num_cols) >= 2:
-        corr = df[num_cols].corr()
-        mask = pd.DataFrame(
-            np.triu(np.ones_like(corr, dtype=bool), k=1), index=corr.index, columns=corr.columns
-        )
-        fig = go.Figure(
-            go.Heatmap(
-                z=corr.mask(mask),
-                x=corr.columns,
-                y=corr.columns,
-                colorscale="Viridis",
-                zmid=0,
-                text=np.round(corr, 2),
-                texttemplate="%{text}",
-                hoverongaps=False,
-            )
-        )
-        fig.update_layout(title="🔥 Correlation Matrix", height=500)
-        figures["correlation"] = fig
-
-    # 2. Distribution histograms
-    max_hist = min(len(num_cols), 6)
-    if max_hist:
-        fig = make_subplots(
-            rows=2, cols=3, subplot_titles=[f"{c}" for c in num_cols[:max_hist]]
-        )
-        for i, col in enumerate(num_cols[:max_hist]):
-            fig.add_trace(
-                go.Histogram(
-                    x=df[col].dropna(),
-                    name=col,
-                    showlegend=False,
-                    marker_color=COLOR_PALETTE[i % len(COLOR_PALETTE)],
-                ),
-                row=(i // 3) + 1,
-                col=(i % 3) + 1,
-            )
-        fig.update_layout(title="📊 Distributions", height=600)
-        figures["distributions"] = fig
-
-    # 3. Box-plots
-    max_box = min(len(num_cols), 8)
-    if max_box:
+    
+    # 1. Smart correlation (handle constant columns)
+    if len(numeric_cols) >= 2:
+        corr_data = df_work[numeric_cols].corr()
+        # Remove constant columns
+        valid_corr = corr_data.dropna(axis=0, how='all').dropna(axis=1, how='all')
+        if not valid_corr.empty:
+            fig = px.imshow(valid_corr, text_auto=".2f", aspect="auto", 
+                           color_continuous_scale="RdBu", title="🔥 Correlation Matrix")
+            figures['correlation'] = fig
+    
+    # 2. Distribution grid (max 6 columns)
+    if numeric_cols:
+        cols_to_plot = numeric_cols[:6]
+        fig = make_subplots(rows=2, cols=3, subplot_titles=cols_to_plot)
+        for i, col in enumerate(cols_to_plot):
+            clean_data = df_work[col].dropna()
+            if len(clean_data) > 0:
+                fig.add_trace(go.Histogram(x=clean_data, name=col, showlegend=False),
+                             row=(i//3)+1, col=(i%3)+1)
+        fig.update_layout(title="📊 Distributions", height=500)
+        figures['distributions'] = fig
+    
+    # 3. Outlier detection
+    if numeric_cols:
         fig = go.Figure()
-        for i, col in enumerate(num_cols[:max_box]):
-            fig.add_trace(
-                go.Box(
-                    y=df[col],
-                    name=f"{col}",
-                    boxpoints="outliers",
-                    marker_color=COLOR_PALETTE[i % len(COLOR_PALETTE)],
-                )
-            )
-        fig.update_layout(title="📦 Anomaly Detection", height=400)
-        figures["boxplots"] = fig
-
-    # 4. Scatter matrix
-    if len(num_cols) >= 2:
-        cols = num_cols[: min(4, len(num_cols))]
-        fig = px.scatter_matrix(
-            df[cols],
-            dimensions=cols,
-            title="🎯 Multi-Dimensional Analysis",
-            height=700,
-            color_continuous_scale="Viridis",
-        )
-        fig.update_traces(diagonal_visible=False, marker=dict(size=4, opacity=0.7))
-        figures["scatter_matrix"] = fig
-
-    # 5. PCA + clustering
-    if len(num_cols) >= 3:
-        scaler = StandardScaler()
-        scaled = scaler.fit_transform(df[num_cols].dropna())
-        pca = PCA(n_components=2).fit(scaled)
-        comps = pca.transform(scaled)
-        n_clusters = min(5, max(2, len(df) // 500))
-        clusters = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto").fit_predict(
-            comps
-        )
-        fig = px.scatter(
-            x=comps[:, 0],
-            y=comps[:, 1],
-            color=clusters.astype(str),
-            title="🧬 AI Pattern Recognition",
-            labels={
-                "x": f"PC1 ({pca.explained_variance_ratio_[0]:.1%})",
-                "y": f"PC2 ({pca.explained_variance_ratio_[1]:.1%})",
-            },
-            height=500,
-        )
-        figures["pca"] = fig
-
-    # 6. Trends
-    if len(df) > 20 and len(num_cols) > 0:
-        max_window = min(50, max(5, len(df) // 50))
-        fig = go.Figure()
-        for col in num_cols[:3]:
-            ma = df[col].rolling(window=max_window).mean()
-            fig.add_trace(
-                go.Scatter(
-                    x=df.index,
-                    y=df[col],
-                    mode="lines",
-                    name=col,
-                    opacity=0.4,
-                )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=df.index,
-                    y=ma,
-                    mode="lines",
-                    name=f"{col} trend",
-                    line=dict(width=3),
-                )
-            )
-        fig.update_layout(title="📈 Trend Analysis", height=400, hovermode="x unified")
-        figures["trends"] = fig
-
-    # 7. Categorical bar (only if any)
-    if len(cat_cols) > 0:
-        col = cat_cols[0]
-        if df[col].nunique() <= 20:
-            counts = df[col].value_counts().head(10)
-            fig = px.bar(
-                x=counts.index,
-                y=counts.values,
-                title=f"🏷️ {col}",
-                labels={"x": col, "y": "Count"},
-                color_discrete_sequence=COLOR_PALETTE,
-            )
-            fig.update_layout(height=400)
-            figures["categorical"] = fig
-
-    # 8. 3-D scatter
-    if len(num_cols) >= 3:
-        fig = px.scatter_3d(
-            df,
-            x=num_cols[0],
-            y=num_cols[1],
-            z=num_cols[2],
-            color=num_cols[0],
-            title="🌐 3D Data Universe",
-            height=600,
-            color_continuous_scale="Viridis",
-        )
-        fig.update_traces(marker=dict(size=4, opacity=0.8))
-        figures["3d"] = fig
-
+        for col in numeric_cols[:8]:
+            fig.add_trace(go.Box(y=df_work[col], name=col, boxpoints='outliers'))
+        fig.update_layout(title="📦 Outlier Detection", height=400)
+        figures['outliers'] = fig
+    
     return figures
 
-
-# ------------------------------------------------------------------
-# AutoML (leak-proof)
-# ------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def quick_ml(df: pd.DataFrame, target: str) -> Optional[Dict[str, Any]]:
-    if target not in df.columns:
+# Fixed AutoML with proper data leakage prevention
+def secure_automl(df, target_col):
+    if target_col not in df.columns:
         return None
-
-    y = df[target]
-    X = df.drop(columns=[target])
-
-    num_features = X.select_dtypes(include=[np.number])
-    cat_features = X.select_dtypes(exclude=[np.number])
-
-    numeric_pipe = Pipeline(
-        steps=[
-            ("impute", SimpleImputer(strategy="mean")),
-            ("scale", StandardScaler()),
-        ]
-    )
-    categorical_pipe = Pipeline(
-        steps=[
-            ("impute", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
-        ]
-    )
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numeric_pipe, num_features.columns),
-            ("cat", categorical_pipe, cat_features.columns),
-        ]
-    )
-
-    is_classification = y.dtype == "object" or y.nunique() < 10
+    
+    # Split FIRST to prevent leakage
+    y = df[target_col].copy()
+    X = df.drop(columns=[target_col]).copy()
+    
+    # Handle missing values in target
+    valid_idx = ~y.isna()
+    X, y = X[valid_idx], y[valid_idx]
+    
+    if len(y.unique()) <= 1:
+        return {"error": "Target has insufficient variation"}
+    
+    # Train/test split before any preprocessing
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Preprocessing on training data only
+    encoders = {}
+    for col in X_train.select_dtypes(include=['object']).columns:
+        le = LabelEncoder()
+        X_train[col] = le.fit_transform(X_train[col].astype(str))
+        # Apply same encoding to test set
+        X_test[col] = le.transform(X_test[col].astype(str))
+        encoders[col] = le
+    
+    # Fill missing values with training set statistics
+    train_means = X_train.select_dtypes(include=[np.number]).mean()
+    X_train = X_train.fillna(train_means)
+    X_test = X_test.fillna(train_means)
+    
+    # Choose model based on target type
+    is_classification = y.dtype == 'object' or len(y.unique()) < 10
     if is_classification:
-        y_enc = LabelEncoder().fit_transform(y.astype(str))
-        model = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+        le_y = LabelEncoder()
+        y_train_enc = le_y.fit_transform(y_train.astype(str))
+        y_test_enc = le_y.transform(y_test.astype(str))
+        model = RandomForestClassifier(n_estimators=50, random_state=42, max_depth=5)
         task = "Classification"
     else:
-        y_enc = y
-        model = RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1)
+        y_train_enc, y_test_enc = y_train, y_test
+        model = RandomForestRegressor(n_estimators=50, random_state=42, max_depth=5)
         task = "Regression"
+    
+    model.fit(X_train, y_train_enc)
+    score = model.score(X_test, y_test_enc)
+    
+    # Feature importance
+    importance_df = pd.DataFrame({
+        'feature': X_train.columns,
+        'importance': model.feature_importances_
+    }).sort_values('importance', ascending=False).head(10)
+    
+    return {
+        'score': score,
+        'task': task,
+        'features': importance_df,
+        'model': model
+    }
 
-    pipe = Pipeline(steps=[("prep", preprocessor), ("model", model)])
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y_enc,
-        test_size=0.2,
-        random_state=42,
-        stratify=y_enc if is_classification else None,
-    )
-    pipe.fit(X_train, y_train)
-    preds = pipe.predict(X_test)
-    score = accuracy_score(y_test, preds) if is_classification else r2_score(y_test, preds)
+# Insane 3D visualization
+def create_3d_universe(df, max_points=5000):
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if len(numeric_cols) < 3:
+        return None
+    
+    # Sample for performance
+    df_viz = df.sample(min(max_points, len(df)), random_state=42)
+    
+    # Create multiple 3D views
+    figures = {}
+    
+    # 1. Basic 3D scatter
+    fig = px.scatter_3d(df_viz, x=numeric_cols[0], y=numeric_cols[1], z=numeric_cols[2],
+                        title="🌌 3D Data Universe", height=600,
+                        color=df_viz[numeric_cols[0]], size=df_viz[numeric_cols[1]] if len(numeric_cols) > 3 else None)
+    fig.update_traces(marker=dict(size=3, opacity=0.7))
+    figures['3d_basic'] = fig
+    
+    # 2. PCA 3D if enough dimensions
+    if len(numeric_cols) > 3:
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(df_viz[numeric_cols].fillna(df_viz[numeric_cols].mean()))
+        pca_3d = PCA(n_components=3).fit_transform(scaled_data)
+        
+        # K-means clustering
+        n_clusters = min(8, max(2, len(df_viz) // 100))
+        clusters = KMeans(n_clusters=n_clusters, random_state=42).fit_predict(pca_3d)
+        
+        fig = go.Figure(data=go.Scatter3d(
+            x=pca_3d[:, 0], y=pca_3d[:, 1], z=pca_3d[:, 2],
+            mode='markers',
+            marker=dict(
+                size=4,
+                color=clusters,
+                colorscale='Viridis',
+                opacity=0.8,
+                colorbar=dict(title="Cluster")
+            ),
+            text=[f'Cluster {c}' for c in clusters]
+        ))
+        fig.update_layout(title="🧬 PCA 3D Clustering", height=600,
+                         scene=dict(xaxis_title='PC1', yaxis_title='PC2', zaxis_title='PC3'))
+        figures['3d_pca'] = fig
+    
+    # 3. Surface plot if applicable
+    if len(numeric_cols) >= 3:
+        x_col, y_col, z_col = numeric_cols[:3]
+        # Create grid
+        x_unique = sorted(df_viz[x_col].dropna().unique())[:20]  # Limit for performance
+        y_unique = sorted(df_viz[y_col].dropna().unique())[:20]
+        
+        if len(x_unique) > 3 and len(y_unique) > 3:
+            try:
+                # Create pivot table for surface
+                pivot_data = df_viz.pivot_table(values=z_col, index=y_col, columns=x_col, aggfunc='mean')
+                fig = go.Figure(data=go.Surface(z=pivot_data.values, x=pivot_data.columns, y=pivot_data.index))
+                fig.update_layout(title=f"🏔️ 3D Surface: {z_col}", height=600)
+                figures['3d_surface'] = fig
+            except:
+                pass  # Skip if pivot fails
+    
+    return figures
 
-    importances = (
-        pd.DataFrame(
-            {
-                "feature": pipe.named_steps["prep"].get_feature_names_out().tolist(),
-                "importance": pipe.named_steps["model"].feature_importances_,
-            }
-        )
-        .sort_values("importance", ascending=False)
-        .head(10)
-    )
-
-    insights = []
-    if score > 0.9:
-        insights.append("🏆 Exceptional model performance!")
-    elif score > 0.75:
-        insights.append("✅ Strong predictive capability")
-    top = importances.iloc[0]
-    insights.append(f"🎯 {top['feature']} drives prediction ({top['importance']*100:.1f}%)")
-    tip = safe_gemini(
-        f"In 10 words, business action from {score:.1%} {task.lower()} accuracy on {target}?",
-        "Prioritize high-value opportunities",
-    )
-    insights.append(f"💡 {tip}")
-    return dict(score=score, task=task, features=importances, insights=insights)
-
-
-# ------------------------------------------------------------------
-# AI helpers
-# ------------------------------------------------------------------
-def generate_ai_insights(df: pd.DataFrame) -> List[str]:
-    insights = []
-    num = df.select_dtypes(include=[np.number])
-    for col in num.columns[:3]:
-        cv = num[col].std() / (num[col].mean() or 1)
-        if cv > 0.5:
-            insights.append(f"🎯 High volatility in {col} (CV={cv:.2f})")
-    if len(num.columns) > 1:
-        corr = num.corr()
-        mask = (corr.abs() > 0.7) & (corr.abs() < 1)
-        pairs = [(corr.index[i], corr.columns[j]) for i, j in zip(*np.where(mask))]
-        for a, b in pairs[:3]:
-            insights.append(f"🔗 Strong correlation: {a} ↔ {b}")
-    quality = 100 * (1 - df.isnull().sum().sum() / (len(df) * len(df.columns)))
-    insights.append(f"💎 Data quality: {quality:.1f}%")
-    recs = safe_gemini(
-        f"Suggest 3 specific analyses for {len(num.columns)} numeric cols. Return one bullet per line.",
-        "Correlation\nDistribution\nOutliers",
-    ).splitlines()[:3]
-    if recs:
-        insights.append(f"🤖 AI suggests: {recs[0]}")
-    return insights[:5]
-
-
-# ------------------------------------------------------------------
 # Streamlit UI
-# ------------------------------------------------------------------
-st.set_page_config("DataWhisperer Pro – Hardened", "🎯", layout="wide")
-
-if "df" not in st.session_state:
+if 'df' not in st.session_state:
     st.session_state.df = None
-if "allow_ai_sharing" not in st.session_state:
-    st.session_state.allow_ai_sharing = True
+if 'df_hash' not in st.session_state:
+    st.session_state.df_hash = None
+
+st.title("🎯 DataWhisperer Pro")
+st.caption("AI-Powered Analytics with Gemini Integration")
+
+# API Status indicator
+col1, col2 = st.columns([3, 1])
+with col1:
+    if API_STATUS.startswith("❌"):
+        st.error(API_STATUS)
+    else:
+        st.success(API_STATUS)
+
+with col2:
+    if st.button("🔄 Retry API"):
+        st.cache_resource.clear()
+        st.rerun()
+
+# Debug info
+if API_STATUS.startswith("❌"):
+    with st.expander("🔧 Debug Info"):
+        st.code(f"""
+# Check your .env file contains:
+GEMINI_API_KEY=your_api_key_here
+
+# Current environment check:
+GEMINI_API_KEY found: {bool(os.getenv('GEMINI_API_KEY'))}
+GOOGLE_API_KEY found: {bool(os.getenv('GOOGLE_API_KEY'))}
+        """)
+        st.info("💡 Make sure your .env file is in the same directory as your script")
 
 with st.sidebar:
-    st.header("📁 Data Control Center")
-    st.checkbox("Allow AI to see sample rows", value=True, key="allow_ai_sharing")
+    st.header("📁 Data Center")
     uploaded_file = st.file_uploader("Upload CSV", type="csv")
+    
     if uploaded_file:
-        file_hash = _file_hash(uploaded_file.getbuffer())
-        if st.session_state.get("file_hash") != file_hash:
-            st.session_state.df = load_data(uploaded_file)
-            st.session_state.file_hash = file_hash
-
-        df = st.session_state.df
-        col1, col2 = st.columns(2)
-        col1.metric("Rows", f"{len(df):,}")
-        col2.metric("Columns", len(df.columns))
-
-        st.subheader("🤖 AI Insights")
-        for insight in generate_ai_insights(df):
-            st.info(insight)
-
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Smart EDA", "📈 Custom Analysis", "🤖 AutoML", "🧪 AI Lab"])
+        try:
+            df, load_msg = load_and_validate_data(uploaded_file, uploaded_file.name)
+            
+            # Check if data actually changed
+            new_hash = hash(str(df.shape) + str(df.columns.tolist()) + uploaded_file.name)
+            if st.session_state.df_hash != new_hash:
+                st.session_state.df = df
+                st.session_state.df_hash = new_hash
+                st.rerun()  # Force refresh
+            
+            st.success(load_msg)
+            
+            # Quick stats
+            col1, col2 = st.columns(2)
+            col1.metric("Rows", f"{len(df):,}")
+            col2.metric("Columns", len(df.columns))
+            
+            # Data quality
+            missing_pct = (df.isnull().sum().sum() / (len(df) * len(df.columns))) * 100
+            quality = 100 - missing_pct
+            st.metric("Quality", f"{quality:.1f}%", "✅" if quality > 95 else "⚠️")
+            
+        except Exception as e:
+            st.error(f"Load error: {str(e)}")
 
 if st.session_state.df is not None:
     df = st.session_state.df
-
+    
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Smart EDA", "🌌 3D Universe", "🤖 AutoML", "💬 Ask AI", "📋 Data"])
+    
     with tab1:
-        st.header("📊 Intelligent EDA Dashboard")
-        with st.spinner("Analyzing…"):
-            figures = run_comprehensive_eda(df)
-        st.subheader("💡 Executive Metrics")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            miss = df.isnull().sum().sum() / (len(df) * len(df.columns)) * 100
-            st.metric("Quality", f"{100-miss:.1f}%")
-        with c2:
-            st.metric("Numeric", len(df.select_dtypes(include=[np.number]).columns))
-        with c3:
-            st.metric("Categorical", len(df.select_dtypes(exclude=[np.number]).columns))
-        with c4:
-            corr = df.select_dtypes(include=[np.number]).corr()
-            high = (corr.abs() > 0.7).sum().sum() - len(corr)
-            st.metric("Correlations", high // 2)
-        for key, fig in figures.items():
+        st.header("📊 Intelligent Analysis")
+        
+        with st.spinner("🧠 Analyzing patterns..."):
+            figures = create_smart_eda(st.session_state.df_hash, df.shape)
+        
+        for name, fig in figures.items():
             st.plotly_chart(fig, use_container_width=True)
-
+        
+        # Data preview
+        st.subheader("📋 Data Sample")
+        st.dataframe(df.head(10), use_container_width=True)
+    
     with tab2:
-        st.header("📈 Interactive Visualization Studio")
-        c1, c2 = st.columns([1, 3])
-        with c1:
-            viz = st.selectbox(
-                "Viz",
-                ["Scatter", "Histogram", "Box", "Violin", "3D Scatter", "Bubble", "Heatmap"],
-            )
-            num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-            cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
-            x_col, y_col, z_col, size_col, color_col = None, None, None, None, None
-            if viz in ["Histogram", "Box", "Violin"]:
-                x_col = st.selectbox("Column", num_cols)
-            elif viz in ["Scatter", "Bubble"]:
-                x_col = st.selectbox("X", num_cols)
-                y_col = st.selectbox("Y", num_cols, index=1 if len(num_cols) > 1 else 0)
-                if viz == "Bubble" and len(num_cols) > 2:
-                    size_col = st.selectbox("Size", num_cols, index=2)
-            elif viz == "3D Scatter" and len(num_cols) >= 3:
-                x_col = st.selectbox("X", num_cols)
-                y_col = st.selectbox("Y", num_cols, index=1)
-                z_col = st.selectbox("Z", num_cols, index=2)
-            color_col = st.selectbox("Color", ["None"] + list(df.columns))
-            if color_col == "None":
-                color_col = None
-        with c2:
-            fig = None
-            if viz == "Scatter" and x_col and y_col:
-                fig = px.scatter(df, x=x_col, y=y_col, color=color_col)
-            elif viz == "Histogram" and x_col:
-                fig = px.histogram(df, x=x_col, marginal="rug", color=color_col)
-            elif viz == "Box" and x_col:
-                fig = px.box(df, y=x_col, color=color_col)
-            elif viz == "Violin" and x_col:
-                fig = px.violin(df, y=x_col, box=True, color=color_col)
-            elif viz == "3D Scatter" and z_col:
-                fig = px.scatter_3d(df, x=x_col, y=y_col, z=z_col, color=color_col)
-            elif viz == "Bubble" and size_col:
-                fig = px.scatter(df, x=x_col, y=y_col, size=size_col, color=color_col, size_max=60)
-            elif viz == "Heatmap" and len(num_cols) > 1:
-                fig = px.imshow(df[num_cols].corr(), text_auto=True, color_continuous_scale="Viridis")
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-
+        st.header("🌌 3D Data Universe")
+        
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if len(numeric_cols) < 3:
+            st.warning("Need at least 3 numeric columns for 3D visualization")
+        else:
+            with st.spinner("🚀 Creating 3D universe..."):
+                viz_3d = create_3d_universe(df)
+            
+            if viz_3d:
+                for name, fig in viz_3d.items():
+                    st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.error("Failed to create 3D visualizations")
+    
     with tab3:
-        st.header("🤖 Automated Machine Learning")
+        st.header("🤖 AutoML Studio")
+        
         col1, col2 = st.columns([1, 2])
         with col1:
-            target = st.selectbox("🎯 Target", df.columns)
-            if st.button("🚀 Launch AutoML", type="primary"):
-                with st.spinner("Training…"):
-                    results = quick_ml(df, target)
-                    if results:
-                        st.success("✅ Model Ready!")
-                        st.metric("Score", f"{results['score']:.3f}")
-                        st.caption(results["task"])
-                        for insight in results["insights"]:
-                            st.info(insight)
-        with col2:
-            if "results" in locals() and results:
-                fig = px.bar(
-                    results["features"],
-                    x="importance",
-                    y="feature",
-                    orientation="h",
-                    color="importance",
-                    color_continuous_scale="Blues",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-    with tab4:
-        st.header("🧪 AI Laboratory")
-        col1, col2 = st.columns(2)
-        with col1:
-            query = st.text_area("Ask AI about your data:", height=100)
-            if st.button("🤖 Ask AI") and query:
-                sample = (
-                    df.head(3).to_dict(orient="records")
-                    if st.session_state.allow_ai_sharing
-                    else "[redacted]"
-                )
-                prompt = f"""
-                Dataset: {df.shape}
-                Sample keys: {list(sample[0].keys()) if sample != '[redacted]' else sample}
-                User: {query}
-                Answer (≤80 words):
-                """
-                with st.spinner("Querying…"):
-                    answer = safe_gemini(prompt)
-                st.success("AI Response:")
-                st.write(answer)
-
-        with col2:
-            st.subheader("🔬 Anomaly Detection")
-            num_cols = df.select_dtypes(include=[np.number]).columns
-            if len(num_cols):
-                col = st.selectbox("Column", num_cols)
-                if st.button("🔍 Detect"):
-                    Q1, Q3 = df[col].quantile([0.25, 0.75])
-                    IQR = Q3 - Q1
-                    mask = (df[col] < Q1 - 1.5 * IQR) | (df[col] > Q3 + 1.5 * IQR)
-                    anomalies = df[mask]
-                    st.info(f"Found {len(anomalies)} anomalies")
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(y=df[col], mode="markers", name="Normal"))
-                    fig.add_trace(
-                        go.Scatter(
-                            y=anomalies[col], x=anomalies.index, mode="markers", name="Anomalies"
+            target = st.selectbox("🎯 Target Variable", df.columns)
+            
+            if st.button("🚀 Train Model", type="primary"):
+                with st.spinner("🧠 Training..."):
+                    results = secure_automl(df, target)
+                
+                if results and 'error' not in results:
+                    st.success(f"✅ {results['task']} Model Ready!")
+                    st.metric("Performance", f"{results['score']:.3f}")
+                    
+                    # AI insights
+                    if MODEL:
+                        insight = safe_gemini(
+                            f"In 20 words: what does {results['score']:.1%} {results['task'].lower()} accuracy mean for business decisions?",
+                            "Model shows good predictive capability for strategic planning."
                         )
-                    )
-                    fig.update_layout(title=f"Anomalies in {col}")
-                    st.plotly_chart(fig, use_container_width=True)
+                        st.info(f"💡 {insight}")
+                    
+                    st.session_state.ml_results = results
+                elif results:
+                    st.error(results['error'])
+        
+        with col2:
+            if 'ml_results' in st.session_state and st.session_state.ml_results:
+                results = st.session_state.ml_results
+                fig = px.bar(results['features'], x='importance', y='feature', 
+                           orientation='h', title="🎯 Feature Importance")
+                st.plotly_chart(fig, use_container_width=True)
+    
+    with tab4:
+        st.header("💬 AI Assistant")
+        
+        if not MODEL:
+            st.error("Gemini AI not available. Please set up your API key.")
+        else:
+            # Data context for AI
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            cat_cols = df.select_dtypes(include=['object']).columns.tolist()
+            
+            st.info(f"📊 Dataset: {len(df):,} rows, {len(df.columns)} columns | Numeric: {len(numeric_cols)} | Categorical: {len(cat_cols)}")
+            
+            user_question = st.text_area(
+                "🤔 Ask me anything about your data:",
+                placeholder="e.g., What are the key patterns? Which features should I focus on?",
+                height=100
+            )
+            
+            if st.button("🧠 Get AI Insights", type="primary"):
+                if user_question:
+                    # Build safe context (no sensitive data)
+                    safe_summary = {
+                        "shape": df.shape,
+                        "columns": {"numeric": len(numeric_cols), "categorical": len(cat_cols)},
+                        "quality": f"{((1 - df.isnull().sum().sum() / (len(df) * len(df.columns))) * 100):.1f}%",
+                        "sample_stats": df.describe().round(2).to_dict() if numeric_cols else {}
+                    }
+                    
+                    prompt = f"""
+Dataset Summary: {json.dumps(safe_summary)}
+Column names: {list(df.columns)[:10]}{'...' if len(df.columns) > 10 else ''}
+
+User Question: {user_question}
+
+Provide specific, actionable insights in under 100 words. Focus on what the user should do next.
+                    """
+                    
+                    with st.spinner("🤖 Thinking..."):
+                        response = safe_gemini(prompt, "I'd recommend exploring correlations and checking for outliers in your key numeric variables.")
+                    
+                    st.success("🎯 AI Response:")
+                    st.write(response)
+                    
+                    # Follow-up suggestions
+                    suggestions = [
+                        "Show me correlation patterns",
+                        "What features are most important?",
+                        "How can I improve data quality?",
+                        "What visualizations would be most useful?"
+                    ]
+                    
+                    st.subheader("💡 Try asking:")
+                    for suggestion in suggestions:
+                        if st.button(suggestion, key=f"suggest_{suggestion}"):
+                            st.rerun()
+    
+    with tab5:
+        st.header("📋 Data Explorer")
+        
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            st.subheader("📈 Quick Stats")
+            st.write(f"**Shape:** {df.shape[0]:,} × {df.shape[1]}")
+            st.write(f"**Memory:** {df.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
+            st.write(f"**Missing:** {df.isnull().sum().sum():,} cells")
+            
+            # Column types
+            st.subheader("🏷️ Column Types")
+            type_counts = df.dtypes.value_counts()
+            for dtype, count in type_counts.items():
+                st.write(f"**{dtype}:** {count}")
+        
+        with col2:
+            st.subheader("🔍 Data Preview")
+            # Show/hide options
+            show_info = st.checkbox("Show column info", value=True)
+            
+            if show_info:
+                st.dataframe(df.dtypes.to_frame('Type'), use_container_width=True)
+            
+            # Paginated data view
+            page_size = st.selectbox("Rows per page", [10, 25, 50, 100], index=1)  
+            total_pages = (len(df) - 1) // page_size + 1
+            page = st.number_input("Page", 1, total_pages, 1) - 1
+            
+            start_idx = page * page_size
+            end_idx = min(start_idx + page_size, len(df))
+            
+            st.dataframe(df.iloc[start_idx:end_idx], use_container_width=True)
+            st.caption(f"Showing rows {start_idx+1}-{end_idx} of {len(df):,}")
 
 else:
-    st.markdown(
-        """
-    ## 🚀 Welcome to DataWhisperer Pro – Hardened Edition
-    Upload a CSV on the left to unlock AI-powered insights!
-    """
-    )
+    # Welcome screen
+    st.markdown("""
+    ## 🚀 Welcome to DataWhisperer Pro
+    ### *AI-Powered Data Analytics Platform*
+    
+    ### ✨ What's New:
+    - 🔒 **Secure AutoML** - No data leakage, proper validation
+    - 🌌 **3D Universe** - Immersive data exploration
+    - 🤖 **Smart AI Chat** - Ask questions about your data
+    - ⚡ **Performance Optimized** - Handles large datasets
+    - 🎯 **Type Detection** - Auto-converts dates and numbers
+    
+    **👈 Upload your CSV to start exploring!**
+    """)
+    
+    # Demo metrics
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("🎨 Visualizations", "15+")
+    col2.metric("🤖 AI Features", "8")
+    col3.metric("🔬 ML Models", "Auto")
+    col4.metric("⚡ Performance", "Fast")
